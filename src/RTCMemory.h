@@ -355,9 +355,9 @@ template<typename T, int N> bool RTCMemory<T, N>::readFromFlash() {
   // Primary backup.
   if (readFileInto(filePath)) { return true; }
 
-  // Recovery: writeToFlash() removes the destination before renaming the temp file over it, so a
-  // crash in that window leaves only the temp file. Promote it to the final path to restore the
-  // backup and close the hole.
+  // Recovery: on filesystems that cannot rename onto an existing path, writeToFlash() removes the
+  // destination before renaming the temp file over it, so a crash in that window leaves only the
+  // temp file. Promote it to the final path to restore the backup and close the hole.
   const String tempPath = filePath + ".tmp";
   if (readFileInto(tempPath)) {
     if (verbosity > 0) Serial.println("Recovered backup from temp file");
@@ -396,12 +396,17 @@ template<typename T, int N> bool RTCMemory<T, N>::writeToFlash() {
     return false;
   }
 
-  // Atomic replace: remove destination then rename temp -> final
-  if (fileSystem.exists(filePath)) { fileSystem.remove(filePath); }
+  // Atomic replace on LittleFS: lfs_rename overwrites a same-type destination in a single
+  // power-loss-safe commit, so no pre-remove is needed (and a pre-remove would open a crash window
+  // with no final file). Fall back to remove+rename for filesystems (e.g. SPIFFS) that reject
+  // renaming onto an existing path; the .tmp recovery in readFromFlash() backstops that window.
   if (!fileSystem.rename(tempPath, filePath)) {
-    if (verbosity > 0) Serial.println("Cannot rename temp backup file");
-    fileSystem.remove(tempPath);
-    return false;
+    if (fileSystem.exists(filePath)) { fileSystem.remove(filePath); }
+    if (!fileSystem.rename(tempPath, filePath)) {
+      if (verbosity > 0) Serial.println("Cannot rename temp backup file");
+      fileSystem.remove(tempPath);
+      return false;
+    }
   }
 
   // Remember what is now on flash to short-circuit redundant writes.
