@@ -23,8 +23,17 @@ void setup() {
   // Change this value before an OTA update to observe if the update succeeds
   Serial.println("v1");
 
-  rtcMemory.begin();
+  if (rtcMemory.begin()) {
+    Serial.println("Previous data found.");
+  } else {
+    Serial.println("No previous data found. The buffer is cleared.");
+  }
+
   MyData* data = rtcMemory.getData();
+  if (data == nullptr) {
+    Serial.println("getData() failed; cannot continue");
+    return;
+  }
 
   data->counter++;
 

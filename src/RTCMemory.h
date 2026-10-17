@@ -20,11 +20,14 @@
 #define RTCMEMORY_H
 
 #include <LittleFS.h>
-#include <type_traits>
 
 /**
  * T is the user data structure, N is the max number of bytes used by this library. N acts like a
  * "soft" limiter.
+ *
+ * OTA always reserves the first 128 bytes of user RTC memory. This library places its data at the
+ * high end of the 512-byte user region and enforces OFFSET >= 32 (blocks), so the total RTCData
+ * size cannot exceed 384 bytes.
  */
 template<typename T, int N = 384> class RTCMemory {
 public:
@@ -33,14 +36,14 @@ public:
    * By default the library uses LittleFS, but you can select an alternative filesystem such as
    * SPIFFS.
    */
-  RTCMemory(String path = "", FS &fs = LittleFS);
+  RTCMemory(const String &path = "", FS &fs = LittleFS);
 
   /**
    * Initialize the buffer using data in RTC memory. If data are invalid, load data from
    * flash. If it fails again, the buffer is cleared. After this call you can safely use this
-   * instance.
+   * instance (unless a hard RTC read/write failure leaves ready == false, which is rare).
    *
-   * Return true if at least one data source is valid, otherwise false.
+   * Return true if at least one data source is valid, otherwise false (buffer was cleared).
    */
   bool begin();
 
@@ -52,7 +55,8 @@ public:
   bool save();
 
   /**
-   * Write data to flash memory.
+   * Write data to flash memory. The CRC (and header) are refreshed from the current buffer before
+   * writing, so backup() is safe to call after modifying getData() without a prior save().
    *
    * Return true if the operation is completed successfully, otherwise false.
    */
@@ -77,22 +81,45 @@ private:
   const static unsigned int BLOCK_SIZE = 4;
 
   /**
+   * Bytes reserved by OTA at the low end of user RTC memory.
+   */
+  const static unsigned int OTA_RESERVED_SIZE = 128;
+
+  /**
+   * Max size available in RTC user memory.
+   */
+  const static unsigned int MAX_TOTAL_RTC_MEMORY_SIZE = 512;
+
+  /**
+   * Max size of RTCData while keeping the OTA reserved region free.
+   */
+  const static unsigned int MAX_RTCDATA_SIZE = MAX_TOTAL_RTC_MEMORY_SIZE - OTA_RESERVED_SIZE;
+
+  /**
+   * Blob format identifiers. Changing VERSION invalidates previous RTC/flash payloads.
+   */
+  const static uint32_t RTC_MAGIC   = 0x4D435452;  // 'RTCM' little-endian
+  const static uint32_t RTC_VERSION = 1;
+
+  /**
+   * Header stored before the user payload (magic + version + crc32).
+   */
+  const static unsigned int HEADER_SIZE = 12;
+
+  /**
+   * Max size of user memory (OTA-safe).
+   */
+  const static unsigned int MAX_USER_RTC_MEMORY_SIZE = MAX_RTCDATA_SIZE - HEADER_SIZE;
+
+  /**
    * Number of bytes to contain the user data structure. This value is ceiled to multiple of 4 to
    * respect the memory alignment of RTC memory.
    */
   const static unsigned int USER_RTC_MEMORY_SIZE = (sizeof(T) - 1) / BLOCK_SIZE * BLOCK_SIZE + BLOCK_SIZE;
 
-  /**
-   * Max size of user memory.
-   */
-  const static unsigned int MAX_USER_RTC_MEMORY_SIZE = 508;
-
-  /**
-   * Max size available in RTC memory.
-   */
-  const static unsigned int MAX_TOTAL_RTC_MEMORY_SIZE = 512;
-
   struct RTCData {
+    uint32_t magic;
+    uint32_t version;
     uint32_t crc32;
     // The user buffer
     byte data[USER_RTC_MEMORY_SIZE];
@@ -132,11 +159,26 @@ private:
   bool readFromFlash();
 
   /**
-   * Save data to flash.
+   * Save data to flash (atomic: write temp file, then rename).
    *
    * Return true on success, otherwise false (return false also if filepath is not set).
    */
   bool writeToFlash();
+
+  /**
+   * Refresh magic/version/CRC and write the buffer to RTC memory.
+   */
+  bool writeToRtc();
+
+  /**
+   * Set magic, version and CRC to match the current user buffer.
+   */
+  void syncHeaderAndCrc();
+
+  /**
+   * Return true if magic, version and CRC match the current buffer.
+   */
+  bool isValidRtcData() const;
 
   /**
    * Calculate the CRC (32bit) of the given buffer.
@@ -150,15 +192,21 @@ private:
    */
   void clearBuffer();
 };
+
 template<typename T, int N>
-RTCMemory<T, N>::RTCMemory(String path, FS &fs) : ready(false), filePath(path), fileSystem(fs) {
-  static_assert(sizeof(T) <= MAX_USER_RTC_MEMORY_SIZE, "The max size of user data is 508 bytes. "
-                                                       "You must reduce the size of your data "
-                                                       "structure.");
-  static_assert(sizeof(RTCData) <= N, "You reach the maximum amount of memory reserved to "
-                                      "RTCMemory lib. You may increase this limit beyond 384 bytes "
-                                      "and up to 512 bytes, but you will lose RTC data after an "
-                                      "OTA update.");
+RTCMemory<T, N>::RTCMemory(const String &path, FS &fs) : ready(false), filePath(path), fileSystem(fs) {
+  static_assert(sizeof(T) <= MAX_USER_RTC_MEMORY_SIZE,
+                "The max size of user data is 372 bytes (OTA-safe). "
+                "You must reduce the size of your data structure.");
+  static_assert(sizeof(RTCData) <= N,
+                "You reach the maximum amount of memory reserved to "
+                "RTCMemory lib. Reduce the size of your data structure "
+                "(OTA requires RTCData <= 384 bytes).");
+  static_assert(OFFSET >= OTA_RESERVED_SIZE / BLOCK_SIZE,
+                "RTCMemory data overlap the OTA reserved RTC region "
+                "(first 128 bytes). Reduce the size of your data structure.");
+  static_assert(sizeof(RTCData) <= MAX_RTCDATA_SIZE,
+                "RTCData exceeds the OTA-safe RTC memory budget.");
 }
 
 template<typename T, int N> bool RTCMemory<T, N>::begin() {
@@ -169,37 +217,38 @@ template<typename T, int N> bool RTCMemory<T, N>::begin() {
 
   if (verbosity > 1) Serial.print("Loading RTC memory... ");
 
-  if (!ESP.rtcUserMemoryRead(OFFSET, (uint32_t *)&rtcData, sizeof(RTCData))) {
-    if (verbosity > 0) Serial.println("Read RTC memory failure");
-    return false;
+  bool loaded = false;
+
+  if (ESP.rtcUserMemoryRead(OFFSET, (uint32_t *)&rtcData, sizeof(RTCData))) {
+    if (isValidRtcData()) {
+      loaded = true;
+      if (verbosity > 1) Serial.println("CRC is correct");
+    } else if (verbosity > 0) {
+      Serial.print("RTC memory content is invalid! Trying to restore backup from flash memory..");
+    }
+  } else if (verbosity > 0) {
+    Serial.println("Read RTC memory failure");
   }
 
-  uint32_t crcOfData = calculateCRC32((uint8_t *)&rtcData.data, USER_RTC_MEMORY_SIZE);
-  if (verbosity > 1) {
-    Serial.print("Calculated CRC: ");
-    Serial.println(crcOfData, HEX);
-    Serial.print("CRC read from RTC memory: ");
-    Serial.println(rtcData.crc32, HEX);
-  }
-
-  ready = true;
-
-  if (crcOfData != rtcData.crc32) {
-    if (verbosity > 0)
-      Serial.print("CRC in RTC memory doesn't match calculated CRC. Data are "
-                   "invalid! Trying to restore backup from flash memory..");
-
+  if (!loaded) {
     if (readFromFlash()) {
+      loaded = true;
       if (verbosity > 1) Serial.println("Loading backup from flash ok");
+      // Keep RTC in sync with the restored backup
+      if (!writeToRtc() && verbosity > 0) {
+        Serial.println("Restored flash backup but RTC write failed");
+      }
     } else {
       if (verbosity > 0) Serial.println("Loading backup from flash FAILED, data are resetted");
       clearBuffer();
+      writeToRtc();
       writeToFlash();
+      ready = true;
       return false;
     }
-  } else {
-    if (verbosity > 1) Serial.println("CRC is correct");
   }
+
+  ready = true;
 
   if (verbosity > 1) Serial.println("Done!");
   return true;
@@ -207,16 +256,7 @@ template<typename T, int N> bool RTCMemory<T, N>::begin() {
 
 template<typename T, int N> bool RTCMemory<T, N>::save() {
   if (ready) {
-    uint32_t crcOfData = calculateCRC32((uint8_t *)&rtcData.data, USER_RTC_MEMORY_SIZE);
-    rtcData.crc32 = crcOfData;
-
-    if (ESP.rtcUserMemoryWrite(OFFSET, (uint32_t *)&rtcData, sizeof(RTCData))) {
-      if (verbosity > 1) Serial.println("Write to RTC memory done");
-      return true;
-    } else {
-      if (verbosity > 0) Serial.println("Write to RTC memory failed");
-      return false;
-    }
+    return writeToRtc();
   } else {
     if (verbosity > 0) Serial.println("Call begin() before using this method");
     return false;
@@ -225,6 +265,7 @@ template<typename T, int N> bool RTCMemory<T, N>::save() {
 
 template<typename T, int N> bool RTCMemory<T, N>::backup() {
   if (ready) {
+    syncHeaderAndCrc();
     return writeToFlash();
   } else {
     if (verbosity > 0) Serial.println("Call begin() before using this method");
@@ -245,7 +286,7 @@ template<typename T, int N> bool RTCMemory<T, N>::persist() {
 template<typename T, int N> T *RTCMemory<T, N>::getData() {
   if (ready) { return reinterpret_cast<T *>(rtcData.data); }
 
-  if (verbosity > 0) Serial.println("Call init before other calls!");
+  if (verbosity > 0) Serial.println("Call begin() before other calls!");
   return nullptr;
 };
 
@@ -267,9 +308,8 @@ template<typename T, int N> bool RTCMemory<T, N>::readFromFlash() {
     int byteRead = f.read((uint8_t *)&rtcData, sizeof(RTCData));
     if (verbosity > 1) Serial.println(String("Bytes read:") + byteRead);
     f.close();
-    if (byteRead != sizeof(RTCData)) { return false; }
-    uint32_t crc = calculateCRC32((uint8_t *)&rtcData.data, USER_RTC_MEMORY_SIZE);
-    if (crc != rtcData.crc32) { return false; }
+    if (byteRead != (int)sizeof(RTCData)) { return false; }
+    if (!isValidRtcData()) { return false; }
   } else {
     if (verbosity > 0) Serial.println(String("Error opening file: ") + filePath);
     return false;
@@ -286,21 +326,56 @@ template<typename T, int N> bool RTCMemory<T, N>::writeToFlash() {
     return false;
   }
 
-  File f = fileSystem.open(filePath, "w");
-  if (f) {
-    int n = f.write((uint8_t *)&rtcData, sizeof(RTCData));
-    f.close();
-    if (n == sizeof(RTCData)) {
-      if (verbosity > 1) Serial.print("Done!");
-      return true;
-    } else {
-      if (verbosity > 0) Serial.println("Cannot write the requested amount of bytes on flash");
-    }
-  } else {
+  const String tempPath = filePath + ".tmp";
+
+  File f = fileSystem.open(tempPath, "w");
+  if (!f) {
     if (verbosity > 0) Serial.println("Error writing file. Is the filesystem initialized?");
     return false;
   }
+
+  int n = f.write((uint8_t *)&rtcData, sizeof(RTCData));
+  f.close();
+
+  if (n != (int)sizeof(RTCData)) {
+    if (verbosity > 0) Serial.println("Cannot write the requested amount of bytes on flash");
+    fileSystem.remove(tempPath);
+    return false;
+  }
+
+  // Atomic replace: remove destination then rename temp -> final
+  if (fileSystem.exists(filePath)) { fileSystem.remove(filePath); }
+  if (!fileSystem.rename(tempPath, filePath)) {
+    if (verbosity > 0) Serial.println("Cannot rename temp backup file");
+    fileSystem.remove(tempPath);
+    return false;
+  }
+
+  if (verbosity > 1) Serial.print("Done!");
+  return true;
+}
+
+template<typename T, int N> bool RTCMemory<T, N>::writeToRtc() {
+  syncHeaderAndCrc();
+
+  if (ESP.rtcUserMemoryWrite(OFFSET, (uint32_t *)&rtcData, sizeof(RTCData))) {
+    if (verbosity > 1) Serial.println("Write to RTC memory done");
+    return true;
+  }
+
+  if (verbosity > 0) Serial.println("Write to RTC memory failed");
   return false;
+}
+
+template<typename T, int N> void RTCMemory<T, N>::syncHeaderAndCrc() {
+  rtcData.magic   = RTC_MAGIC;
+  rtcData.version = RTC_VERSION;
+  rtcData.crc32   = calculateCRC32((uint8_t *)rtcData.data, USER_RTC_MEMORY_SIZE);
+}
+
+template<typename T, int N> bool RTCMemory<T, N>::isValidRtcData() const {
+  if (rtcData.magic != RTC_MAGIC || rtcData.version != RTC_VERSION) { return false; }
+  return calculateCRC32((uint8_t *)rtcData.data, USER_RTC_MEMORY_SIZE) == rtcData.crc32;
 }
 
 template<typename T, int N> uint32_t RTCMemory<T, N>::calculateCRC32(const uint8_t *data, size_t length) const {
@@ -319,8 +394,7 @@ template<typename T, int N> uint32_t RTCMemory<T, N>::calculateCRC32(const uint8
 
 template<typename T, int N> void RTCMemory<T, N>::clearBuffer() {
   memset((void *)&rtcData.data, 0, USER_RTC_MEMORY_SIZE);
-  uint32_t result = calculateCRC32((uint8_t *)rtcData.data, USER_RTC_MEMORY_SIZE);
-  rtcData.crc32 = result;
+  syncHeaderAndCrc();
 }
 
 #endif  // END RTCMEMORY_H

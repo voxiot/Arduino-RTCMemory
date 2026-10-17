@@ -30,7 +30,7 @@ void setup() {
 
   unsigned long start, end;
 
-  RTCMemory<byte> rtcMem("/etc/rtc_mem.bin");
+  RTCMemory<byte> rtcMem("/rtc_mem.bin");
   byte *data = rtcMem.getData();
   if (data == nullptr) {
     Serial.println("OK: here nullptr is expected, you have to initialize the instance explicitly");

@@ -5,7 +5,7 @@
 #include <RTCMemory.h>
 
 // Define a struct that maps what's inside the RTC memory
-// Max size is 508 bytes.
+// Max size is 372 bytes (OTA-safe).
 typedef struct {
   int counter;
 } MyData;
