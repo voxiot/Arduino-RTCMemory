@@ -58,13 +58,22 @@ public:
    * Write data to flash memory. The CRC (and header) are refreshed from the current buffer before
    * writing, so backup() is safe to call after modifying getData() without a prior save().
    *
-   * Return true if the operation is completed successfully, otherwise false.
+   * To spare flash wear, this call is skipped (and returns true) when the buffer is byte-identical
+   * to the last payload successfully written to flash.
+   *
+   * WARNING: this performs BLOCKING filesystem I/O (open/write/close/rename). Do not call it from
+   * time-critical paths or ISRs; it can take tens of milliseconds depending on the filesystem.
+   *
+   * Return true if the operation is completed successfully (or skipped as unchanged), otherwise
+   * false.
    */
   bool backup();
 
   /**
    * Write data to both RTC and flash RTCMemory. It is equivalent to subsequent call to save() and
    * backup().
+   *
+   * WARNING: like backup(), this performs BLOCKING filesystem I/O. See backup() for details.
    *
    * Return true if both write operations are completed successfully, otherwise false.
    */
@@ -140,6 +149,13 @@ private:
   bool ready;
 
   /**
+   * Dirty-check state for the flash backup: CRC of the last payload successfully written to flash
+   * and whether such a backup is known to exist. Used to skip redundant writeToFlash() calls.
+   */
+  bool hasFlashBackup;
+  uint32_t lastFlashedCrc;
+
+  /**
    * Verbosity levels:
    * 0 - No output (Default)
    * 1 - Only errors
@@ -152,11 +168,19 @@ private:
   FS &fileSystem;
 
   /**
-   * Load data from flash.
+   * Load data from flash. Tries the primary backup first, then the temp file left behind by an
+   * interrupted writeToFlash() (crash between remove() and rename()).
    *
    * Return true if it reads valid data, otherwise false (return false also if filepath is not set).
    */
   bool readFromFlash();
+
+  /**
+   * Read and validate a backup file into the buffer.
+   *
+   * Return true if the file exists, has the expected size and a valid header/CRC.
+   */
+  bool readFileInto(const String &path);
 
   /**
    * Save data to flash (atomic: write temp file, then rename).
@@ -194,7 +218,8 @@ private:
 };
 
 template<typename T, int N>
-RTCMemory<T, N>::RTCMemory(const String &path, FS &fs) : ready(false), filePath(path), fileSystem(fs) {
+RTCMemory<T, N>::RTCMemory(const String &path, FS &fs)
+  : ready(false), hasFlashBackup(false), lastFlashedCrc(0), filePath(path), fileSystem(fs) {
   static_assert(sizeof(T) <= MAX_USER_RTC_MEMORY_SIZE,
                 "The max size of user data is 372 bytes (OTA-safe). "
                 "You must reduce the size of your data structure.");
@@ -207,6 +232,11 @@ RTCMemory<T, N>::RTCMemory(const String &path, FS &fs) : ready(false), filePath(
                 "(first 128 bytes). Reduce the size of your data structure.");
   static_assert(sizeof(RTCData) <= MAX_RTCDATA_SIZE,
                 "RTCData exceeds the OTA-safe RTC memory budget.");
+  static_assert(alignof(T) <= BLOCK_SIZE,
+                "T requires an alignment greater than 4 bytes (e.g. it contains "
+                "uint64_t/double). The RTC buffer is only 4-byte aligned, so such "
+                "a type would cause unaligned access faults on the ESP8266. Split "
+                "64-bit members into 32-bit halves.");
 }
 
 template<typename T, int N> bool RTCMemory<T, N>::begin() {
@@ -233,6 +263,9 @@ template<typename T, int N> bool RTCMemory<T, N>::begin() {
   if (!loaded) {
     if (readFromFlash()) {
       loaded = true;
+      // The flash backup matches the buffer we just loaded.
+      hasFlashBackup = true;
+      lastFlashedCrc = rtcData.crc32;
       if (verbosity > 1) Serial.println("Loading backup from flash ok");
       // Keep RTC in sync with the restored backup
       if (!writeToRtc() && verbosity > 0) {
@@ -266,6 +299,8 @@ template<typename T, int N> bool RTCMemory<T, N>::save() {
 template<typename T, int N> bool RTCMemory<T, N>::backup() {
   if (ready) {
     syncHeaderAndCrc();
+    // Skip the write (and the flash wear) when nothing changed since the last backup.
+    if (hasFlashBackup && rtcData.crc32 == lastFlashedCrc) { return true; }
     return writeToFlash();
   } else {
     if (verbosity > 0) Serial.println("Call begin() before using this method");
@@ -275,8 +310,7 @@ template<typename T, int N> bool RTCMemory<T, N>::backup() {
 
 template<typename T, int N> bool RTCMemory<T, N>::persist() {
   if (ready) {
-    bool res = save();
-    if (res) { return writeToFlash(); }
+    if (save()) { return backup(); }
   } else {
     if (verbosity > 0) Serial.println("Call begin() before using this method");
   }
@@ -290,6 +324,26 @@ template<typename T, int N> T *RTCMemory<T, N>::getData() {
   return nullptr;
 };
 
+template<typename T, int N> bool RTCMemory<T, N>::readFileInto(const String &path) {
+  if (!fileSystem.exists(path)) {
+    if (verbosity > 0) Serial.println(String("File not existing: ") + path);
+    return false;
+  }
+
+  File f = fileSystem.open(path, "r");
+  if (!f) {
+    if (verbosity > 0) Serial.println(String("Error opening file: ") + path);
+    return false;
+  }
+
+  int byteRead = f.read((uint8_t *)&rtcData, sizeof(RTCData));
+  if (verbosity > 1) Serial.println(String("Bytes read:") + byteRead);
+  f.close();
+
+  if (byteRead != (int)sizeof(RTCData)) { return false; }
+  return isValidRtcData();
+}
+
 template<typename T, int N> bool RTCMemory<T, N>::readFromFlash() {
   if (verbosity > 1) Serial.print(String("Reading from ") + filePath + "... ");
 
@@ -298,24 +352,23 @@ template<typename T, int N> bool RTCMemory<T, N>::readFromFlash() {
     return false;
   }
 
-  if (!fileSystem.exists(filePath)) {
-    if (verbosity > 0) Serial.println("File not existing");
-    return false;
+  // Primary backup.
+  if (readFileInto(filePath)) { return true; }
+
+  // Recovery: writeToFlash() removes the destination before renaming the temp file over it, so a
+  // crash in that window leaves only the temp file. Promote it to the final path to restore the
+  // backup and close the hole.
+  const String tempPath = filePath + ".tmp";
+  if (readFileInto(tempPath)) {
+    if (verbosity > 0) Serial.println("Recovered backup from temp file");
+    if (fileSystem.exists(filePath)) { fileSystem.remove(filePath); }
+    if (!fileSystem.rename(tempPath, filePath) && verbosity > 0) {
+      Serial.println("Cannot promote temp backup file");
+    }
+    return true;
   }
 
-  File f = fileSystem.open(filePath, "r");
-  if (f) {
-    int byteRead = f.read((uint8_t *)&rtcData, sizeof(RTCData));
-    if (verbosity > 1) Serial.println(String("Bytes read:") + byteRead);
-    f.close();
-    if (byteRead != (int)sizeof(RTCData)) { return false; }
-    if (!isValidRtcData()) { return false; }
-  } else {
-    if (verbosity > 0) Serial.println(String("Error opening file: ") + filePath);
-    return false;
-  }
-
-  return true;
+  return false;
 }
 
 template<typename T, int N> bool RTCMemory<T, N>::writeToFlash() {
@@ -350,6 +403,10 @@ template<typename T, int N> bool RTCMemory<T, N>::writeToFlash() {
     fileSystem.remove(tempPath);
     return false;
   }
+
+  // Remember what is now on flash to short-circuit redundant writes.
+  hasFlashBackup = true;
+  lastFlashedCrc = rtcData.crc32;
 
   if (verbosity > 1) Serial.print("Done!");
   return true;
