@@ -1,6 +1,6 @@
 {
-    "name": "RTCMemory",
-    "version": "3.1.0",
+    "name": "Arduino-RTCMemory",
+    "version": "3.1.1",
     "authors": {
         "name": "Fabiano Riccardi",
         "email": "fabiano.riccardi@outlook.com"
