@@ -1,6 +1,6 @@
 {
     "name": "Arduino-RTCMemory",
-    "version": "3.1.1",
+    "version": "3.2.0",
     "authors": {
         "name": "Fabiano Riccardi",
         "email": "fabiano.riccardi@outlook.com"
@@ -50,6 +50,20 @@
             "base": "examples/BasicOTA",
             "files": [
                 "BasicOTA.ino"
+            ]
+        },
+        {
+            "name": "StreamBuffer",
+            "base": "examples/StreamBuffer",
+            "files": [
+                "StreamBuffer.ino"
+            ]
+        },
+        {
+            "name": "StreamSegments",
+            "base": "examples/StreamSegments",
+            "files": [
+                "StreamSegments.ino"
             ]
         }
     ]

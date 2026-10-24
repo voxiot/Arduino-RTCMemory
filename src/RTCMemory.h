@@ -20,6 +20,7 @@
 #define RTCMEMORY_H
 
 #include <LittleFS.h>
+#include "RTCMemoryFormat.h"
 
 /**
  * T is the user data structure, N is the max number of bytes used by this library. N acts like a
@@ -87,33 +88,33 @@ public:
   T *getData();
 
 private:
-  const static unsigned int BLOCK_SIZE = 4;
+  const static unsigned int BLOCK_SIZE = RTCMemoryDetail::Format::WordBytes;
 
   /**
    * Bytes reserved by OTA at the low end of user RTC memory.
    */
-  const static unsigned int OTA_RESERVED_SIZE = 128;
+  const static unsigned int OTA_RESERVED_SIZE = RTCMemoryDetail::Format::ReservedBytes;
 
   /**
    * Max size available in RTC user memory.
    */
-  const static unsigned int MAX_TOTAL_RTC_MEMORY_SIZE = 512;
+  const static unsigned int MAX_TOTAL_RTC_MEMORY_SIZE = RTCMemoryDetail::Format::TotalBytes;
 
   /**
    * Max size of RTCData while keeping the OTA reserved region free.
    */
-  const static unsigned int MAX_RTCDATA_SIZE = MAX_TOTAL_RTC_MEMORY_SIZE - OTA_RESERVED_SIZE;
+  const static unsigned int MAX_RTCDATA_SIZE = RTCMemoryDetail::Format::AvailableBytes;
 
   /**
    * Blob format identifiers. Changing VERSION invalidates previous RTC/flash payloads.
    */
-  const static uint32_t RTC_MAGIC   = 0x4D435452;  // 'RTCM' little-endian
-  const static uint32_t RTC_VERSION = 1;
+  const static uint32_t RTC_MAGIC   = RTCMemoryDetail::Format::Magic;  // 'RTCM' little-endian
+  const static uint32_t RTC_VERSION = RTCMemoryDetail::Format::Version;
 
   /**
    * Header stored before the user payload (magic + version + crc32).
    */
-  const static unsigned int HEADER_SIZE = 12;
+  const static unsigned int HEADER_SIZE = RTCMemoryDetail::Format::HeaderBytes;
 
   /**
    * Max size of user memory (OTA-safe).
@@ -124,7 +125,7 @@ private:
    * Number of bytes to contain the user data structure. This value is ceiled to multiple of 4 to
    * respect the memory alignment of RTC memory.
    */
-  const static unsigned int USER_RTC_MEMORY_SIZE = (sizeof(T) - 1) / BLOCK_SIZE * BLOCK_SIZE + BLOCK_SIZE;
+  const static unsigned int USER_RTC_MEMORY_SIZE = RTCMemoryDetail::Format::alignedSize(sizeof(T));
 
   struct RTCData {
     uint32_t magic;
@@ -441,17 +442,7 @@ template<typename T, int N> bool RTCMemory<T, N>::isValidRtcData() const {
 }
 
 template<typename T, int N> uint32_t RTCMemory<T, N>::calculateCRC32(const uint8_t *data, size_t length) const {
-  uint32_t crc = 0xffffffff;
-  while (length--) {
-    uint8_t c = *data++;
-    for (uint32_t i = 0x80; i > 0; i >>= 1) {
-      bool bit = crc & 0x80000000;
-      if (c & i) { bit = !bit; }
-      crc <<= 1;
-      if (bit) { crc ^= 0x04c11db7; }
-    }
-  }
-  return crc;
+  return RTCMemoryDetail::Format::crc(0xFFFFFFFFu, data, length);
 }
 
 template<typename T, int N> void RTCMemory<T, N>::clearBuffer() {
